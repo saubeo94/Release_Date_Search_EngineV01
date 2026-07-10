@@ -127,34 +127,72 @@ if st.button("Search", type="primary"):
 
     # ---------------------------------------------------------------- Zenith
     if aggregator == "Zenith":
-        try:
-            with st.spinner("Fetching from Airtable…"):
-                records = fetch_airtable()
-        except RuntimeError:
-            st.error(
-                "No Airtable token configured. Add `AIRTABLE_TOKEN` in the app's "
-                "secrets (see README). Until then, check the shared view directly:"
-            )
-            st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-            st.stop()
-        except requests.RequestException as exc:
-            st.error(f"Airtable request failed: {exc}")
-            st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-            st.stop()
+        records = None
+        mirror_id = st.secrets.get("ZENITH_SHEET_ID", "").strip()
+        mirror_gid = str(st.secrets.get("ZENITH_SHEET_GID", "0")).strip()
 
-        hits = search_airtable(records, game_name)
-        if not hits:
-            st.info(f'No Zenith record matches "{game_name}".')
-        for fields in hits[:20]:
-            dates = date_like_fields(fields)
-            title = next((v for v in fields.values() if isinstance(v, str)), "Match")
-            with st.container(border=True):
-                st.subheader(title)
-                if dates:
-                    for k, v in dates.items():
-                        st.metric(k, str(v))
-                with st.expander("All fields"):
-                    st.json(fields)
+        # 1) preferred: the Google Sheet mirror kept in sync by a connector
+        if mirror_id:
+            try:
+                with st.spinner("Fetching Zenith mirror sheet…"):
+                    df = fetch_sheet(mirror_id, mirror_gid)
+            except requests.RequestException as exc:
+                st.error(
+                    f"Could not read the Zenith mirror sheet ({exc}). Make sure "
+                    "it is shared as “anyone with the link can view”."
+                )
+                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
+                st.stop()
+
+            hits = search_sheet(df, game_name)
+            if hits.empty:
+                st.info(f'No match for "{game_name}" in the Zenith mirror.')
+            else:
+                display = hits.copy()
+                date_cols = [
+                    c for c in display.columns
+                    if any(w in c.lower() for w in ("date", "release", "launch"))
+                ]
+                st.success(f"{len(display)} match(es) found")
+                if date_cols:
+                    ordered = date_cols + [c for c in display.columns if c not in date_cols]
+                    display = display[ordered]
+                st.dataframe(display, use_container_width=True, hide_index=True)
+            records = []  # mirror handled the search; skip the API path below
+
+        # 2) fallback: Airtable API (needs token)
+        if records is None:
+            try:
+                with st.spinner("Fetching from Airtable…"):
+                    records = fetch_airtable()
+            except RuntimeError:
+                st.error(
+                    "Zenith is not configured yet. Add `ZENITH_SHEET_ID` (mirror "
+                    "sheet) or `AIRTABLE_TOKEN` in the app's secrets (see README). "
+                    "Until then, check the shared view directly:"
+                )
+                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
+                st.stop()
+            except requests.RequestException as exc:
+                st.error(f"Airtable request failed: {exc}")
+                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
+                st.stop()
+
+        # display Airtable API results (skipped when the mirror handled it)
+        if not mirror_id:
+            hits = search_airtable(records, game_name)
+            if not hits:
+                st.info(f'No Zenith record matches "{game_name}".')
+            for fields in hits[:20]:
+                dates = date_like_fields(fields)
+                title = next((v for v in fields.values() if isinstance(v, str)), "Match")
+                with st.container(border=True):
+                    st.subheader(title)
+                    if dates:
+                        for k, v in dates.items():
+                            st.metric(k, str(v))
+                    with st.expander("All fields"):
+                        st.json(fields)
 
     # -------------------------------------------------------------------- SS
     else:

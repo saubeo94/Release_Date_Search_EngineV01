@@ -13,6 +13,32 @@ release date live from the right source:
 
 A "Search SlotCatalog via Google" fallback link is always shown.
 
+## Zenith mirror (recommended way to get live Zenith data)
+
+Instead of an Airtable token, mirror the Zenith Airtable into a Google Sheet
+with a free connector, and let the app read the sheet. One-time setup by
+someone who is a collaborator on the Zenith base:
+
+1. **Create an empty Google Sheet** (e.g. "Zenith mirror") and set sharing to
+   "anyone with the link can view".
+2. **Set up the sync** with one of these free tools:
+   - **Data Fetcher** (Airtable extension): in the Zenith base, add the Data
+     Fetcher extension → create an *export* request → destination: Google
+     Sheets → pick your mirror sheet → set a schedule (e.g. daily).
+   - **Coupler.io**: new importer → source: Airtable (paste the shared view
+     URL) → destination: your Google Sheet → schedule it.
+3. **Point the app at the mirror**: in Streamlit Cloud → App → Settings →
+   Secrets, add:
+   ```toml
+   ZENITH_SHEET_ID = "the long id from the sheet URL"
+   ZENITH_SHEET_GID = "0"    # the gid= value of the tab, 0 for the first tab
+   ```
+   Save — the app reboots and Zenith searches now read the mirror.
+
+Source priority for Zenith: mirror sheet → Airtable API token → link to the
+shared view. The app automatically shows any column containing
+"date" / "release" / "launch" first in the results.
+
 ## Deploy online for the team (recommended: Streamlit Community Cloud, free)
 
 1. Push this folder to a GitHub repository (public or private):
