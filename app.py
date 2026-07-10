@@ -1,6 +1,7 @@
 """Release date finder — search game release dates across SS and Zenith sources."""
 
 import io
+import re
 import urllib.parse
 
 import pandas as pd
@@ -18,6 +19,7 @@ SS_SHEETS = {
 AIRTABLE_BASE = "appcJn8Ck6R7RTccl"
 AIRTABLE_TABLE = "tblsnoI1fwUkVfg73"
 AIRTABLE_VIEW = "viwJ2rBmrvjE5YGoG"
+ZENITH_SHARE_ID = "shrb8FLfCo7RMpy9C"
 AIRTABLE_SHARED_URL = (
     "https://airtable.com/appcJn8Ck6R7RTccl/shrb8FLfCo7RMpy9C/"
     "tblsnoI1fwUkVfg73/viwJ2rBmrvjE5YGoG"
@@ -59,6 +61,93 @@ def fetch_airtable() -> list[dict]:
             return records
 
 
+def _cell_to_text(value) -> str:
+    """Flatten Airtable cell values (strings, dicts, lists) into display text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("name", "text", "url", "filename", "value"):
+            if key in value and isinstance(value[key], (str, int, float)):
+                return str(value[key])
+        return str(value)
+    if isinstance(value, list):
+        return ", ".join(_cell_to_text(v) for v in value)
+    return str(value)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_shared_view() -> pd.DataFrame:
+    """Read the Zenith *shared view* without a token (self-coded mirror).
+
+    Loads the public share page, extracts the parameters Airtable's own
+    front-end uses, then calls the internal readSharedViewData endpoint.
+    This endpoint is undocumented — if Airtable changes it, this raises
+    and the app falls back to the shared-view link button.
+    """
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        ),
+    })
+    page = sess.get(f"https://airtable.com/{ZENITH_SHARE_ID}", timeout=30)
+    page.raise_for_status()
+    html = page.text
+
+    def find(pattern: str) -> str | None:
+        m = re.search(pattern, html)
+        return m.group(1) if m else None
+
+    app_id = find(r'"applicationId"\s*:\s*"(app[A-Za-z0-9]+)"') or AIRTABLE_BASE
+
+    # Preferred: the ready-made data URL embedded in the page.
+    url_path = find(r'"(/v0\.3/view/viw[A-Za-z0-9]+/readSharedViewData[^"]*)"')
+    if url_path:
+        data_url = "https://airtable.com" + url_path.encode().decode("unicode_escape")
+    else:
+        # Fallback: rebuild it from its parts.
+        access_policy = find(r'accessPolicy=([^&"\\\s]+)')
+        request_id = find(r'"requestId"\s*:\s*"(req[A-Za-z0-9]+)"')
+        if not access_policy:
+            raise RuntimeError(
+                "Could not locate the shared-view data endpoint — Airtable "
+                "may have changed the share page format."
+            )
+        data_url = (
+            f"https://airtable.com/v0.3/view/{AIRTABLE_VIEW}/readSharedViewData"
+            f"?stringifiedObjectParams=%7B%7D"
+            f"&requestId={request_id or ''}&accessPolicy={access_policy}"
+        )
+
+    resp = sess.get(
+        data_url,
+        headers={
+            "x-airtable-application-id": app_id,
+            "x-requested-with": "XMLHttpRequest",
+            "x-time-zone": "UTC",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    table = data.get("table", {})
+    col_names = {c["id"]: c.get("name", c["id"]) for c in table.get("columns", [])}
+    rows = []
+    for row in table.get("rows", []):
+        cells = row.get("cellValuesByColumnId") or {}
+        rows.append({
+            col_names.get(cid, cid): _cell_to_text(val) for cid, val in cells.items()
+        })
+    if not rows:
+        raise RuntimeError("Shared view returned no rows.")
+    return pd.DataFrame(rows).fillna("")
+
+
 # -------------------------------------------------------------------- helpers
 
 def search_sheet(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -94,6 +183,23 @@ def slotcatalog_link(query: str) -> str:
     )
 
 
+def show_df_hits(df: pd.DataFrame, query: str, source_label: str) -> None:
+    """Search a dataframe and render results with date columns first."""
+    hits = search_sheet(df, query)
+    if hits.empty:
+        st.info(f'No match for "{query}" in {source_label}.')
+        return
+    display = hits.copy()
+    date_cols = [
+        c for c in display.columns
+        if any(w in str(c).lower() for w in ("date", "release", "launch"))
+    ]
+    if date_cols:
+        display = display[date_cols + [c for c in display.columns if c not in date_cols]]
+    st.success(f"{len(display)} match(es) found in {source_label}")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
 # ------------------------------------------------------------------------- ui
 
 st.set_page_config(page_title="Release date finder", page_icon="🎰", layout="centered")
@@ -126,73 +232,65 @@ if st.button("Search", type="primary"):
         st.stop()
 
     # ---------------------------------------------------------------- Zenith
+    # Source chain: mirror sheet -> Airtable API token -> shared-view reader
+    # -> link to the shared view. First source that works wins.
     if aggregator == "Zenith":
-        records = None
+        handled = False
+        failures = []
+
+        # 1) Google Sheet mirror (if configured in secrets)
         mirror_id = st.secrets.get("ZENITH_SHEET_ID", "").strip()
         mirror_gid = str(st.secrets.get("ZENITH_SHEET_GID", "0")).strip()
-
-        # 1) preferred: the Google Sheet mirror kept in sync by a connector
         if mirror_id:
             try:
                 with st.spinner("Fetching Zenith mirror sheet…"):
                     df = fetch_sheet(mirror_id, mirror_gid)
+                show_df_hits(df, game_name, "the Zenith mirror sheet")
+                handled = True
             except requests.RequestException as exc:
-                st.error(
-                    f"Could not read the Zenith mirror sheet ({exc}). Make sure "
-                    "it is shared as “anyone with the link can view”."
-                )
-                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-                st.stop()
+                failures.append(f"mirror sheet: {exc}")
 
-            hits = search_sheet(df, game_name)
-            if hits.empty:
-                st.info(f'No match for "{game_name}" in the Zenith mirror.')
-            else:
-                display = hits.copy()
-                date_cols = [
-                    c for c in display.columns
-                    if any(w in c.lower() for w in ("date", "release", "launch"))
-                ]
-                st.success(f"{len(display)} match(es) found")
-                if date_cols:
-                    ordered = date_cols + [c for c in display.columns if c not in date_cols]
-                    display = display[ordered]
-                st.dataframe(display, use_container_width=True, hide_index=True)
-            records = []  # mirror handled the search; skip the API path below
-
-        # 2) fallback: Airtable API (needs token)
-        if records is None:
+        # 2) Airtable API (if a token is configured in secrets)
+        if not handled and st.secrets.get("AIRTABLE_TOKEN", ""):
             try:
-                with st.spinner("Fetching from Airtable…"):
+                with st.spinner("Fetching from Airtable API…"):
                     records = fetch_airtable()
-            except RuntimeError:
-                st.error(
-                    "Zenith is not configured yet. Add `ZENITH_SHEET_ID` (mirror "
-                    "sheet) or `AIRTABLE_TOKEN` in the app's secrets (see README). "
-                    "Until then, check the shared view directly:"
-                )
-                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-                st.stop()
-            except requests.RequestException as exc:
-                st.error(f"Airtable request failed: {exc}")
-                st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-                st.stop()
+                hits = search_airtable(records, game_name)
+                if not hits:
+                    st.info(f'No Zenith record matches "{game_name}".')
+                for fields in hits[:20]:
+                    dates = date_like_fields(fields)
+                    title = next(
+                        (v for v in fields.values() if isinstance(v, str)), "Match"
+                    )
+                    with st.container(border=True):
+                        st.subheader(title)
+                        if dates:
+                            for k, v in dates.items():
+                                st.metric(k, str(v))
+                        with st.expander("All fields"):
+                            st.json(fields)
+                handled = True
+            except (RuntimeError, requests.RequestException) as exc:
+                failures.append(f"Airtable API: {exc}")
 
-        # display Airtable API results (skipped when the mirror handled it)
-        if not mirror_id:
-            hits = search_airtable(records, game_name)
-            if not hits:
-                st.info(f'No Zenith record matches "{game_name}".')
-            for fields in hits[:20]:
-                dates = date_like_fields(fields)
-                title = next((v for v in fields.values() if isinstance(v, str)), "Match")
-                with st.container(border=True):
-                    st.subheader(title)
-                    if dates:
-                        for k, v in dates.items():
-                            st.metric(k, str(v))
-                    with st.expander("All fields"):
-                        st.json(fields)
+        # 3) Shared-view reader (no token needed; uses an unofficial endpoint)
+        if not handled:
+            try:
+                with st.spinner("Reading the Zenith shared view…"):
+                    df = fetch_shared_view()
+                show_df_hits(df, game_name, "the Zenith shared view")
+                handled = True
+            except (RuntimeError, requests.RequestException, ValueError) as exc:
+                failures.append(f"shared view: {exc}")
+
+        # 4) Last resort: hand the user the link
+        if not handled:
+            st.error(
+                "Couldn't fetch Zenith data from any source. "
+                + " | ".join(failures)
+            )
+            st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
 
     # -------------------------------------------------------------------- SS
     else:

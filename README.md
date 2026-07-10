@@ -13,6 +13,22 @@ release date live from the right source:
 
 A "Search SlotCatalog via Google" fallback link is always shown.
 
+## How Zenith data is fetched (source priority)
+
+The app tries these sources in order and uses the first one that works:
+
+1. **Mirror Google Sheet** — if `ZENITH_SHEET_ID` is set in secrets (see below)
+2. **Airtable API** — if `AIRTABLE_TOKEN` is set in secrets
+3. **Built-in shared-view reader** — no setup needed. The app reads the public
+   shared view the same way a browser does, via Airtable's internal
+   `readSharedViewData` endpoint. ⚠️ This endpoint is *undocumented*: Airtable
+   can change or block it at any time, at which point the app automatically
+   falls back to option 4. Don't rely on it as the long-term solution.
+4. **Link button** to the shared Airtable view (manual lookup)
+
+So the app works out of the box with zero Zenith setup (via #3), and you can
+harden it later by adding a mirror sheet (#1) or token (#2).
+
 ## Zenith mirror (recommended way to get live Zenith data)
 
 Instead of an Airtable token, mirror the Zenith Airtable into a Google Sheet
