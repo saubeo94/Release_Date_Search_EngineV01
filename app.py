@@ -95,8 +95,20 @@ def fetch_shared_view() -> pd.DataFrame:
             "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
         ),
     })
-    page = sess.get(f"https://airtable.com/{ZENITH_SHARE_ID}", timeout=30)
-    page.raise_for_status()
+    # Some shares only resolve at the full path, others at the short link —
+    # try both.
+    page = None
+    last_exc = None
+    for share_url in (AIRTABLE_SHARED_URL, f"https://airtable.com/{ZENITH_SHARE_ID}"):
+        try:
+            candidate = sess.get(share_url, timeout=30)
+            candidate.raise_for_status()
+            page = candidate
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+    if page is None:
+        raise RuntimeError(f"Share page could not be loaded: {last_exc}")
     html = page.text
 
     def find(pattern: str) -> str | None:
