@@ -16,6 +16,10 @@ SS_SHEETS = {
     "tada": ("1YfVQqjWga0txvHm2oU_CGuLJLtXY1qmI2q3kAR0uDeU", "2124566733", "game list"),
 }
 
+# Amb aggregator sources — fill in once you have the sheet/source for each
+# provider, same shape as SS_SHEETS: "provider": (sheet_id, gid, "tab name").
+AMB_SHEETS: dict[str, tuple[str, str, str]] = {}
+
 AIRTABLE_BASE = "appcJn8Ck6R7RTccl"
 AIRTABLE_TABLE = "tblsnoI1fwUkVfg73"
 AIRTABLE_VIEW = "viwJ2rBmrvjE5YGoG"
@@ -197,11 +201,36 @@ def date_like_fields(fields: dict) -> dict:
     }
 
 
-def slotcatalog_link(query: str) -> str:
-    return (
-        "https://www.google.com/search?q="
-        + urllib.parse.quote_plus(f"site:slotcatalog.com {query}")
+def google_search_url(query: str) -> str:
+    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_google_cse(query: str, num: int = 3) -> list[dict]:
+    """Return top Google results via the Custom Search JSON API (free tier).
+
+    Needs GOOGLE_API_KEY and GOOGLE_CSE_ID in secrets. Raises RuntimeError
+    with 'no-key' if not configured, so the caller can fall back to links.
+    """
+    key = st.secrets.get("GOOGLE_API_KEY", "").strip()
+    cx = st.secrets.get("GOOGLE_CSE_ID", "").strip()
+    if not key or not cx:
+        raise RuntimeError("no-key")
+    resp = requests.get(
+        "https://www.googleapis.com/customsearch/v1",
+        params={"key": key, "cx": cx, "q": query, "num": num},
+        timeout=30,
     )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+    return [
+        {
+            "title": it.get("title", ""),
+            "link": it.get("link", ""),
+            "snippet": it.get("snippet", ""),
+        }
+        for it in items[:num]
+    ]
 
 
 def show_df_hits(df: pd.DataFrame, query: str, source_label: str) -> None:
@@ -228,8 +257,21 @@ st.set_page_config(page_title="Release date finder", page_icon="🎰", layout="c
 st.markdown(
     """
     <style>
-      .stButton > button[kind="primary"] { width: 100%; }
-      div[data-testid="stHorizontalBlock"] { gap: 0.5rem; }
+      .stButton > button[kind="primary"] { width: auto; padding: 0.4rem 1.4rem; }
+      /* Black "Zenith" link button */
+      a.zenith-btn {
+        display: inline-block;
+        background: #111111;
+        color: #ffffff !important;
+        text-decoration: none !important;
+        padding: 0.45rem 1.5rem;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 0.95rem;
+        line-height: 1.6;
+        white-space: nowrap;
+      }
+      a.zenith-btn:hover { background: #333333; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -243,78 +285,29 @@ providers = (
     .dropna().str.strip().tolist()
 )
 
-game_name = st.text_input("Game name", placeholder="e.g. Lucky Jaguar")
+# --- Aggregator card: SS / Amb radio on the left, black Zenith link on the right
+with st.container(border=True):
+    left, right = st.columns([2, 1])
+    with left:
+        aggregator = st.radio("Aggregator", ["SS", "Amb"], horizontal=True)
+    with right:
+        st.markdown("&nbsp;", unsafe_allow_html=True)  # vertical spacing to align
+        st.markdown(
+            f'<a class="zenith-btn" href="{AIRTABLE_SHARED_URL}" target="_blank">'
+            "Zenith</a>",
+            unsafe_allow_html=True,
+        )
+
+game_name = st.text_input("Game name", placeholder="e.g. Super Ace")
 provider = st.selectbox("Game provider", providers)
-aggregator = st.radio("Aggregator", ["SS", "Zenith"], horizontal=True)
 
 if st.button("Search", type="primary"):
     if not game_name.strip():
         st.warning("Enter a game name first.")
         st.stop()
 
-    # ---------------------------------------------------------------- Zenith
-    # Source chain: mirror sheet -> Airtable API token -> shared-view reader
-    # -> link to the shared view. First source that works wins.
-    if aggregator == "Zenith":
-        handled = False
-        failures = []
-
-        # 1) Google Sheet mirror (if configured in secrets)
-        mirror_id = st.secrets.get("ZENITH_SHEET_ID", "").strip()
-        mirror_gid = str(st.secrets.get("ZENITH_SHEET_GID", "0")).strip()
-        if mirror_id:
-            try:
-                with st.spinner("Fetching Zenith mirror sheet…"):
-                    df = fetch_sheet(mirror_id, mirror_gid)
-                show_df_hits(df, game_name, "the Zenith mirror sheet")
-                handled = True
-            except requests.RequestException as exc:
-                failures.append(f"mirror sheet: {exc}")
-
-        # 2) Airtable API (if a token is configured in secrets)
-        if not handled and st.secrets.get("AIRTABLE_TOKEN", ""):
-            try:
-                with st.spinner("Fetching from Airtable API…"):
-                    records = fetch_airtable()
-                hits = search_airtable(records, game_name)
-                if not hits:
-                    st.info(f'No Zenith record matches "{game_name}".')
-                for fields in hits[:20]:
-                    dates = date_like_fields(fields)
-                    title = next(
-                        (v for v in fields.values() if isinstance(v, str)), "Match"
-                    )
-                    with st.container(border=True):
-                        st.subheader(title)
-                        if dates:
-                            for k, v in dates.items():
-                                st.metric(k, str(v))
-                        with st.expander("All fields"):
-                            st.json(fields)
-                handled = True
-            except (RuntimeError, requests.RequestException) as exc:
-                failures.append(f"Airtable API: {exc}")
-
-        # 3) Shared-view reader (no token needed; uses an unofficial endpoint)
-        if not handled:
-            try:
-                with st.spinner("Reading the Zenith shared view…"):
-                    df = fetch_shared_view()
-                show_df_hits(df, game_name, "the Zenith shared view")
-                handled = True
-            except (RuntimeError, requests.RequestException, ValueError) as exc:
-                failures.append(f"shared view: {exc}")
-
-        # 4) Last resort: hand the user the link
-        if not handled:
-            st.error(
-                "Couldn't fetch Zenith data from any source. "
-                + " | ".join(failures)
-            )
-            st.link_button("Open Zenith Airtable", AIRTABLE_SHARED_URL)
-
     # -------------------------------------------------------------------- SS
-    else:
+    if aggregator == "SS":
         key = provider.strip().lower()
         if key not in SS_SHEETS:
             st.warning(
@@ -345,7 +338,52 @@ if st.button("Search", type="primary"):
                 st.success(f"{len(display)} match(es) found")
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # ---------------------------------------------------------- fallback card
+    # ------------------------------------------------------------------- Amb
+    else:
+        key = provider.strip().lower()
+        if key not in AMB_SHEETS:
+            st.warning(
+                f"No Amb source is configured yet for **{provider}**. "
+                "Use the internet search below in the meantime."
+            )
+        else:
+            sheet_id, gid, tab = AMB_SHEETS[key]
+            try:
+                with st.spinner(f"Fetching “{tab}” sheet…"):
+                    df = fetch_sheet(sheet_id, gid)
+                show_df_hits(df, game_name, f"the Amb {provider} source")
+            except requests.RequestException as exc:
+                st.error(
+                    f"Could not read the Amb source ({exc}). Make sure it is "
+                    "shared as “anyone with the link can view”."
+                )
+
+    # ------------------------------------------------------- internet section
     with st.container(border=True):
         st.markdown("**Internet**  \nIf not found in official sources, search here.")
-        st.link_button("Search SlotCatalog via Google", slotcatalog_link(game_name))
+        prov = provider.strip()
+        phrases = [
+            f"{game_name.strip()} {prov} release date bigwinboard",
+            f"{game_name.strip()} {prov} release date slotcatalog",
+            f"{game_name.strip()} {prov} release date",
+        ]
+        for phrase in phrases:
+            st.markdown(f"**{phrase}**")
+            try:
+                results = fetch_google_cse(phrase)
+                if not results:
+                    st.caption("No results returned.")
+                for r in results:
+                    st.markdown(
+                        f"[{r['title']}]({r['link']})  \n"
+                        f"<span style='color:#6b7280;font-size:0.85rem'>"
+                        f"{r['snippet']}</span>",
+                        unsafe_allow_html=True,
+                    )
+            except RuntimeError:
+                # No Custom Search API key configured -> show a search link
+                st.link_button("Search on Google", google_search_url(phrase))
+            except requests.RequestException as exc:
+                st.caption(f"Search unavailable ({exc}).")
+                st.link_button("Search on Google", google_search_url(phrase))
+            st.divider()
