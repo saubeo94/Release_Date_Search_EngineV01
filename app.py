@@ -111,20 +111,25 @@ def fetch_shared_view() -> pd.DataFrame:
         raise RuntimeError(f"Share page could not be loaded: {last_exc}")
     html = page.text
 
-    def find(pattern: str) -> str | None:
-        m = re.search(pattern, html)
+    def find(pattern: str, text: str | None = None) -> str | None:
+        m = re.search(pattern, text if text is not None else html)
         return m.group(1) if m else None
 
     app_id = find(r'"applicationId"\s*:\s*"(app[A-Za-z0-9]+)"') or AIRTABLE_BASE
+    page_load_id = find(r'"pageLoadId"\s*:\s*"(pgl[A-Za-z0-9]+)"')
 
-    # Preferred: the ready-made data URL embedded in the page.
-    url_path = find(r'"(/v0\.3/view/viw[A-Za-z0-9]+/readSharedViewData[^"]*)"')
+    # Preferred: the ready-made data URL embedded in the page. Airtable
+    # JSON-escapes slashes (\u002F), so unescape before matching too.
+    unescaped = html.replace("\\u002F", "/").replace("\\u002f", "/").replace("\\/", "/")
+    url_path = find(
+        r'"(/v0\.3/view/viw[A-Za-z0-9]+/readSharedViewData\?[^"]*)"', unescaped
+    )
     if url_path:
-        data_url = "https://airtable.com" + url_path.encode().decode("unicode_escape")
+        data_url = "https://airtable.com" + url_path
     else:
         # Fallback: rebuild it from its parts.
-        access_policy = find(r'accessPolicy=([^&"\\\s]+)')
-        request_id = find(r'"requestId"\s*:\s*"(req[A-Za-z0-9]+)"')
+        access_policy = find(r'accessPolicy=([^&"\\\s]+)', unescaped)
+        request_id = find(r'"requestId"\s*:\s*"(req[A-Za-z0-9]+)"', unescaped)
         if not access_policy:
             raise RuntimeError(
                 "Could not locate the shared-view data endpoint — Airtable "
@@ -136,15 +141,19 @@ def fetch_shared_view() -> pd.DataFrame:
             f"&requestId={request_id or ''}&accessPolicy={access_policy}"
         )
 
-    resp = sess.get(
-        data_url,
-        headers={
-            "x-airtable-application-id": app_id,
-            "x-requested-with": "XMLHttpRequest",
-            "x-time-zone": "UTC",
-        },
-        timeout=30,
-    )
+    headers = {
+        "x-airtable-application-id": app_id,
+        "x-airtable-inter-service-client": "webClient",
+        "x-requested-with": "XMLHttpRequest",
+        "x-time-zone": "UTC",
+        "x-user-locale": "en",
+        "Referer": page.url,
+        "Accept": "application/json",
+    }
+    if page_load_id:
+        headers["x-airtable-page-load-id"] = page_load_id
+
+    resp = sess.get(data_url, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json().get("data", {})
     table = data.get("table", {})
