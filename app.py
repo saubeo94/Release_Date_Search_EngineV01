@@ -3,6 +3,7 @@
 import io
 import re
 import urllib.parse
+from html import unescape
 
 import pandas as pd
 import requests
@@ -206,7 +207,105 @@ def google_search_url(query: str) -> str:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_google_cse(query: str, num: int = 3) -> list[dict]:
+def fetch_ddg(query: str, num: int = 1) -> list[dict]:
+    """Best-effort search via DuckDuckGo's HTML endpoint — no API key needed.
+
+    Datacenter IPs (like Streamlit Cloud) may get rate-limited or blocked; on
+    any failure this returns an empty list and the caller shows a search link.
+    """
+    resp = requests.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            ),
+            "Referer": "https://duckduckgo.com/",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    html_text = resp.text
+
+    def strip_tags(s: str) -> str:
+        return unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+    def decode_href(href: str) -> str:
+        m = re.search(r"uddg=([^&]+)", href)
+        return urllib.parse.unquote(m.group(1)) if m else href
+
+    titles = re.findall(
+        r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html_text, re.S
+    )
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html_text, re.S)
+
+    results = []
+    for i, (href, title_html) in enumerate(titles[:num]):
+        link = decode_href(href)
+        results.append({
+            "title": strip_tags(title_html),
+            "link": link,
+            "snippet": strip_tags(snippets[i]) if i < len(snippets) else "",
+            "display_link": urllib.parse.urlparse(link).netloc,
+            "thumbnail": "",
+        })
+    return results
+
+
+def first_web_result(phrase: str) -> list[dict]:
+    """Get the top result: Google CSE if a key is set, else DuckDuckGo."""
+    try:
+        return fetch_google_cse(phrase, num=1)
+    except RuntimeError:
+        return fetch_ddg(phrase, num=1)
+
+
+def render_result_card(r: dict) -> None:
+    """Render one Google result as a card resembling a search snippet."""
+    domain = r.get("display_link", "")
+    favicon = (
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+        if domain else ""
+    )
+    thumb_html = (
+        f'<img src="{r["thumbnail"]}" '
+        'style="width:92px;height:92px;object-fit:cover;border-radius:8px;'
+        'flex-shrink:0;" />'
+        if r.get("thumbnail") else ""
+    )
+    fav_html = (
+        f'<img src="{favicon}" style="width:16px;height:16px;border-radius:50%;" />'
+        if favicon else ""
+    )
+    st.markdown(
+        f"""
+        <div style="border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;
+                    background:#fff;display:flex;gap:14px;align-items:flex-start;
+                    margin-bottom:6px;">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">
+              {fav_html}
+              <span style="font-size:0.8rem;color:#202124;">{domain}</span>
+            </div>
+            <a href="{r['link']}" target="_blank"
+               style="font-size:1.1rem;color:#1a0dab;text-decoration:none;
+                      font-weight:500;display:block;margin:2px 0;">
+              {r['title']}
+            </a>
+            <div style="font-size:0.85rem;color:#4d5156;line-height:1.4;">
+              {r['snippet']}
+            </div>
+          </div>
+          {thumb_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_google_cse(query: str, num: int = 1) -> list[dict]:
     """Return top Google results via the Custom Search JSON API (free tier).
 
     Needs GOOGLE_API_KEY and GOOGLE_CSE_ID in secrets. Raises RuntimeError
@@ -223,14 +322,22 @@ def fetch_google_cse(query: str, num: int = 3) -> list[dict]:
     )
     resp.raise_for_status()
     items = resp.json().get("items", [])
-    return [
-        {
+    results = []
+    for it in items[:num]:
+        pagemap = it.get("pagemap", {}) or {}
+        thumb = ""
+        if pagemap.get("cse_thumbnail"):
+            thumb = pagemap["cse_thumbnail"][0].get("src", "")
+        elif pagemap.get("cse_image"):
+            thumb = pagemap["cse_image"][0].get("src", "")
+        results.append({
             "title": it.get("title", ""),
             "link": it.get("link", ""),
             "snippet": it.get("snippet", ""),
-        }
-        for it in items[:num]
-    ]
+            "display_link": it.get("displayLink", ""),
+            "thumbnail": thumb,
+        })
+    return results
 
 
 def show_df_hits(df: pd.DataFrame, query: str, source_label: str) -> None:
@@ -360,30 +467,21 @@ if st.button("Search", type="primary"):
 
     # ------------------------------------------------------- internet section
     with st.container(border=True):
-        st.markdown("**Internet**  \nIf not found in official sources, search here.")
+        st.markdown("**Internet**")
         prov = provider.strip()
+        name = game_name.strip()
         phrases = [
-            f"{game_name.strip()} {prov} release date bigwinboard",
-            f"{game_name.strip()} {prov} release date slotcatalog",
-            f"{game_name.strip()} {prov} release date",
+            f"{name} {prov} release date bigwinboard",
+            f"{name} {prov} release date slotcatalog",
+            f"{name} {prov} release date",
         ]
         for phrase in phrases:
-            st.markdown(f"**{phrase}**")
             try:
-                results = fetch_google_cse(phrase)
-                if not results:
-                    st.caption("No results returned.")
-                for r in results:
-                    st.markdown(
-                        f"[{r['title']}]({r['link']})  \n"
-                        f"<span style='color:#6b7280;font-size:0.85rem'>"
-                        f"{r['snippet']}</span>",
-                        unsafe_allow_html=True,
-                    )
-            except RuntimeError:
-                # No Custom Search API key configured -> show a search link
+                results = first_web_result(phrase)
+            except requests.RequestException:
+                results = []
+            if results:
+                render_result_card(results[0])
+            else:
+                st.markdown(f"*{phrase}*")
                 st.link_button("Search on Google", google_search_url(phrase))
-            except requests.RequestException as exc:
-                st.caption(f"Search unavailable ({exc}).")
-                st.link_button("Search on Google", google_search_url(phrase))
-            st.divider()
