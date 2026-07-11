@@ -371,12 +371,13 @@ st.markdown(
         background: #111111;
         color: #ffffff !important;
         text-decoration: none !important;
-        padding: 0.45rem 1.5rem;
+        padding: 0.35rem 1.4rem;
         border-radius: 8px;
         font-weight: 600;
         font-size: 0.95rem;
         line-height: 1.6;
         white-space: nowrap;
+        margin-top: 2px;
       }
       a.zenith-btn:hover { background: #333333; }
     </style>
@@ -392,13 +393,18 @@ providers = (
     .dropna().str.strip().tolist()
 )
 
-# --- Aggregator card: SS / Amb radio on the left, black Zenith link on the right
+# --- Aggregator card: SS / Amb radio with the Zenith link right beside it.
+# Radio and button live in adjacent narrow columns so the gap between the
+# "Amb" option and the Zenith button matches the gap between SS and Amb.
 with st.container(border=True):
-    left, right = st.columns([2, 1])
-    with left:
-        aggregator = st.radio("Aggregator", ["SS", "Amb"], horizontal=True)
-    with right:
-        st.markdown("&nbsp;", unsafe_allow_html=True)  # vertical spacing to align
+    st.markdown("Aggregator")
+    radio_col, btn_col, spacer = st.columns([1.1, 0.9, 3])
+    with radio_col:
+        aggregator = st.radio(
+            "Aggregator", ["SS", "Amb"], horizontal=True,
+            label_visibility="collapsed",
+        )
+    with btn_col:
         st.markdown(
             f'<a class="zenith-btn" href="{AIRTABLE_SHARED_URL}" target="_blank">'
             "Zenith</a>",
