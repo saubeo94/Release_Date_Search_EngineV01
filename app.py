@@ -562,16 +562,8 @@ def _pick_col(df: pd.DataFrame, want: str, avoid: tuple = ()):
     return None
 
 
-def batch_lookup(game: str, provider: str, sources: dict) -> dict:
-    """Look one parsed row up in the configured provider sheets."""
-    if not _norm_name(game):
-        return {"state": "SKIPPED", "date_raw": "", "note": "couldn't read a game name"}
-    prov_key, cfg = find_source(provider, sources)
-    if cfg is None:
-        return {
-            "state": "NO SOURCE", "date_raw": "",
-            "note": f"no sheet configured for “{provider}” — use the web link",
-        }
+def _sheet_search(game: str, cfg: tuple) -> dict:
+    """Search one provider document for a game name and classify its date."""
     sheet_id, gid, tab = cfg
     try:
         df = fetch_sheet_smart(sheet_id, gid)
@@ -602,6 +594,43 @@ def batch_lookup(game: str, provider: str, sources: dict) -> dict:
         return {"state": "NOT YET RELEASED", "date_raw": date_raw,
                 "note": (note + " · " if note else "") + f"releases in {days} day{'s' if days != 1 else ''}"}
     return {"state": "RELEASED", "date_raw": date_raw, "note": note}
+
+
+def batch_lookup(game: str, provider: str, sources: dict) -> dict:
+    """Look one parsed row up in the configured provider documents.
+
+    With a matching provider slot, only that document is searched. Without
+    one (no provider pasted, or none configured for it), every document is
+    searched by game name — so pasting a bare name copied straight out of a
+    provider sheet still finds its date there."""
+    if not _norm_name(game):
+        return {"state": "SKIPPED", "date_raw": "", "note": "couldn't read a game name"}
+    prov_key, cfg = find_source(provider, sources)
+    if cfg is not None:
+        return _sheet_search(game, cfg)
+
+    found = []
+    for p_key, p_cfg in sources.items():
+        res = _sheet_search(game, p_cfg)
+        if res["state"] not in ("NOT FOUND", "ERROR"):
+            found.append((p_cfg[2], res))
+    if found:
+        # Sister brands can list the same game (e.g. JILI carries TaDa titles
+        # in a dateless "Customer Limited" section) — prefer the document
+        # that actually gives a readable date.
+        found.sort(key=lambda t: 0 if t[1]["state"] in ("RELEASED", "NOT YET RELEASED") else 1)
+        tab_label, res = found[0]
+        found_in = f"found in the {tab_label} document"
+        if provider:
+            found_in += " — verify the provider"
+        if len(found) > 1:
+            found_in += " (also listed in " + ", ".join(t[0] for t in found[1:]) + ")"
+        res["note"] = found_in + (" · " + res["note"] if res["note"] else "")
+        return res
+    if provider:
+        return {"state": "NO SOURCE", "date_raw": "",
+                "note": f"no sheet configured for “{provider}” — use the web link"}
+    return {"state": "NOT FOUND", "date_raw": "", "note": "not in any configured document"}
 
 
 # ------------------------------------------- Zenith list (ONEAPI CSV export)
