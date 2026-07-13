@@ -52,11 +52,16 @@ def sheet_edit_url(sheet_id: str, gid: str) -> str:
 
 
 def find_source(provider: str, sources: dict):
-    """Match a detected provider against configured source slots (fuzzy)."""
+    """Match a detected provider against configured source slots (fuzzy,
+    brand-family aware — a TaDa row can match the JILI document slot)."""
     pv = _norm_vendor(provider)
+    # exact/containment first, then brand-family matches
     for prov_key, cfg in sources.items():
         pk = _norm_vendor(prov_key)
         if pk and pv and (pk == pv or pk in pv or pv in pk):
+            return prov_key, cfg
+    for prov_key, cfg in sources.items():
+        if _same_brand(_norm_vendor(prov_key), pv):
             return prov_key, cfg
     return None, None
 
@@ -421,6 +426,41 @@ def _after_colon(c: str) -> str:
     return c.split(":")[-1].strip()
 
 
+# The aggregator prefix in the sync sheet's provider cell ("zen: Tada",
+# "SS: Jili", "amb: …") names the channel the game is opened through — the
+# release date that decides MP opening is the one from THAT channel's source.
+_CHANNELS = {"zen": "Zenith", "zenith": "Zenith", "ss": "SS", "amb": "Amb"}
+
+
+def _channel_of(provider_raw: str) -> str:
+    if _has_provider_colon(provider_raw):
+        return _CHANNELS.get(_norm_vendor(provider_raw.split(":")[0]), "")
+    return ""
+
+
+# Brands that are one provider underneath (regional labels of the same games):
+# vendor matching treats members of a family as equivalent.
+BRAND_FAMILIES = [{"jili", "tada"}]
+
+
+def _brand_family(v: str):
+    for fam in BRAND_FAMILIES:
+        for member in fam:
+            if member == v or (len(v) >= 3 and (member in v or v in member)):
+                return fam
+    return None
+
+
+def _same_brand(a: str, b: str) -> bool:
+    """Normalized vendors match: equal, containment, or same brand family."""
+    if not a or not b:
+        return False
+    if a == b or (len(a) >= 3 and len(b) >= 3 and (a in b or b in a)):
+        return True
+    fa = _brand_family(a)
+    return fa is not None and fa is _brand_family(b)
+
+
 def _has_provider_colon(c: str) -> bool:
     return (
         ":" in c
@@ -497,7 +537,8 @@ def parse_pasted_rows(text: str, vendor_keys: list[str]) -> list[dict]:
             game = usable[0] if usable else ""
             provider_raw = usable[1] if len(usable) > 1 else ""
             provider = _after_colon(provider_raw) if _has_provider_colon(provider_raw) else provider_raw
-        rows.append({"idx": idx, "game": game, "provider": provider, "provider_raw": provider_raw})
+        rows.append({"idx": idx, "game": game, "provider": provider,
+                     "provider_raw": provider_raw, "channel": _channel_of(provider_raw)})
     return rows
 
 
@@ -562,17 +603,27 @@ def _pick_col(df: pd.DataFrame, want: str, avoid: tuple = ()):
     return None
 
 
+# Text the provider documents put in the date column when a game has no
+# public release: an availability status, not a missing/broken date.
+_AVAILABILITY_RE = re.compile(
+    r"customer\s*limited|validation\s*in\s*progress|region\s*limited|coming\s*soon|^-+$",
+    re.I,
+)
+
+
 def _sheet_search(game: str, cfg: tuple) -> dict:
     """Search one provider document for a game name and classify its date."""
     sheet_id, gid, tab = cfg
     try:
         df = fetch_sheet_smart(sheet_id, gid)
     except requests.RequestException as exc:
-        return {"state": "ERROR", "date_raw": "", "note": f"couldn't fetch the {tab} sheet ({exc})"}
+        return {"state": "ERROR", "date_raw": "", "doc": tab,
+                "note": f"couldn't fetch the {tab} sheet ({exc})"}
     name_col = _pick_col(df, "name", avoid=("chinese", "中文"))
     date_col = _pick_col(df, "release")
     if name_col is None or date_col is None:
-        return {"state": "ERROR", "date_raw": "", "note": f"couldn't locate name/date columns in the {tab} sheet"}
+        return {"state": "ERROR", "date_raw": "", "doc": tab,
+                "note": f"couldn't locate name/date columns in the {tab} sheet"}
 
     target = _norm_name(game)
     names = df[name_col].map(_norm_name)
@@ -580,20 +631,25 @@ def _sheet_search(game: str, cfg: tuple) -> dict:
     if hits.empty:
         hits = df[names.str.contains(re.escape(target), na=False)]
     if hits.empty:
-        return {"state": "NOT FOUND", "date_raw": "", "note": f"not in the {tab} sheet"}
+        return {"state": "NOT FOUND", "date_raw": "", "doc": tab, "note": f"not in the {tab} sheet"}
 
     date_raw = str(hits.iloc[0][date_col]).strip()
     note = f"{len(hits)} matches — showing first" if len(hits) > 1 else ""
     d, precision = _parse_any_date(date_raw)
     if d is None:
-        return {"state": "CHECK", "date_raw": date_raw, "note": (note + " · " if note else "") + "unreadable date"}
+        if _AVAILABILITY_RE.search(date_raw):
+            return {"state": "STATUS", "date_raw": date_raw, "doc": tab,
+                    "note": (note + " · " if note else "") +
+                            f"listed as “{date_raw}” in the {tab} document (no public release date)"}
+        return {"state": "CHECK", "date_raw": date_raw, "doc": tab,
+                "note": (note + " · " if note else "") + "unreadable date"}
     if precision != "full":
         note = (note + " · " if note else "") + f"source only gives the {precision}"
     if d > date.today():
         days = (d - date.today()).days
-        return {"state": "NOT YET RELEASED", "date_raw": date_raw,
+        return {"state": "NOT YET RELEASED", "date_raw": date_raw, "doc": tab, "precision": precision,
                 "note": (note + " · " if note else "") + f"releases in {days} day{'s' if days != 1 else ''}"}
-    return {"state": "RELEASED", "date_raw": date_raw, "note": note}
+    return {"state": "RELEASED", "date_raw": date_raw, "doc": tab, "precision": precision, "note": note}
 
 
 def batch_lookup(game: str, provider: str, sources: dict) -> dict:
@@ -664,6 +720,10 @@ def parse_zenith_csv(text: str) -> pd.DataFrame:
         "date": df[h_date].str.strip(),
         "status": df[h_status].str.strip() if h_status else "",
     })
+    return _finish_zenith(out)
+
+
+def _finish_zenith(out: pd.DataFrame) -> pd.DataFrame:
     out = out[out["name"] != ""].reset_index(drop=True)
     out["_name"] = out["name"].map(_norm_name)
     out["_vendor"] = out["vendor"].map(_norm_vendor)
@@ -674,6 +734,39 @@ def parse_zenith_csv(text: str) -> pd.DataFrame:
 def load_zenith_bundled() -> pd.DataFrame:
     with open(ZENITH_CSV_PATH, encoding="utf-8-sig") as f:
         return parse_zenith_csv(f.read())
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_zenith_airtable() -> pd.DataFrame:
+    """Read the Zenith game list live from Airtable (needs AIRTABLE_TOKEN in
+    secrets). Same base/table/view the shared link points at; dates arrive
+    ISO (2026-06-26), which _parse_any_date already understands."""
+    token = st.secrets.get("AIRTABLE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("no-token")
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_TABLE}"
+    headers = {"Authorization": f"Bearer {token}"}
+    records, offset = [], None
+    while True:
+        params = {"view": AIRTABLE_VIEW, "pageSize": 100}
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        records.extend(payload.get("records", []))
+        offset = payload.get("offset")
+        if not offset:
+            break
+    rows = [{
+        "name": str(f.get("Game Name", "")).strip(),
+        "vendor": str(f.get("Vendor", "")).strip(),
+        "date": str(f.get("Released Date", "")).strip(),
+        "status": str(f.get("Game Status", "")).strip(),
+    } for r in records for f in [r.get("fields", {})]]
+    if not rows:
+        raise RuntimeError("Airtable returned no records")
+    return _finish_zenith(pd.DataFrame(rows))
 
 
 def _zen_classify(s: str) -> str:
@@ -706,12 +799,10 @@ def zenith_lookup(game: str, provider: str, zdf: pd.DataFrame) -> dict:
     pv = _norm_vendor(provider)
     if pv:
         exact = pool[pool["_vendor"] == pv]
-        if exact.empty:
-            fuzzy = pool[pool["_vendor"].map(
-                lambda rv: bool(rv) and (rv in pv or pv in rv)
-            )]
-        else:
-            fuzzy = exact
+        # containment or same brand family (JILI ≡ TaDa) both count as a match
+        fuzzy = exact if not exact.empty else pool[pool["_vendor"].map(
+            lambda rv: _same_brand(rv, pv)
+        )]
         if not fuzzy.empty:
             pool = fuzzy
         else:
@@ -803,8 +894,10 @@ if "sources" not in st.session_state:
 zenith_df, zenith_src, zenith_error = None, "", ""
 with st.expander("Input sources — where the release dates come from"):
     st.markdown(
-        "**Zenith** — monthly “ONEAPI Updated Game List” Airtable export, "
-        "bundled with the app. Upload a fresh export to use it for this session:"
+        "**Zenith** — the “ONEAPI Updated Game List” Airtable. Read live via "
+        "the API when a token is configured (Streamlit secrets → "
+        "`AIRTABLE_TOKEN`), otherwise the bundled monthly export is used. "
+        "Uploading a CSV here overrides both for this session:"
     )
     uploaded = st.file_uploader("Fresh ONEAPI export", type="csv", key="zenith_upload",
                                 label_visibility="collapsed")
@@ -814,6 +907,12 @@ with st.expander("Input sources — where the release dates come from"):
             zenith_src = "uploaded CSV (this session only)"
         except Exception as exc:  # noqa: BLE001 — show any parse problem
             st.error(f"Couldn't read that CSV: {exc}")
+if zenith_df is None:
+    try:
+        zenith_df = load_zenith_airtable()
+        zenith_src = "live from Airtable"
+    except Exception:  # noqa: BLE001 — no token or API trouble → bundled CSV
+        pass
     st.markdown(
         "**Provider documents (SS / Amb)** — the release-date sheets the "
         "providers publish. Paste a Google Sheets link (including the tab's "
@@ -902,29 +1001,66 @@ with tab_batch:
                     looked.append({**r, "state": "", "date_raw": "", "sheet_date": "",
                                    "note": "header row" if r.get("header") else ""})
                     continue
-                sheet = batch_lookup(r["game"], r["provider"], eff_all)
+                channel = r.get("channel", "")
+                docs = eff_ss if channel == "SS" else eff_amb if channel == "Amb" else eff_all
+                sheet = batch_lookup(r["game"], r["provider"], docs or eff_all)
                 zen = (zenith_lookup(r["game"], r["provider"], zenith_df)
                        if zenith_df is not None
                        else {"state": "NOT FOUND", "date_raw": "", "note": ""})
 
-                # Zenith is the platform truth for opening games on MP, so its
-                # verdict wins; the SS/Amb sheet date rides along as cross-check.
-                if zen["state"] not in ("NOT FOUND", "SKIPPED"):
-                    state, date_raw, note = zen["state"], zen["date_raw"], zen["note"]
-                    if sheet["state"] in ("RELEASED", "NOT YET RELEASED", "CHECK") and sheet["date_raw"]:
-                        zd, _ = _parse_any_date(zen["date_raw"])
-                        sd, _ = _parse_any_date(sheet["date_raw"])
-                        if zd and sd and zd != sd:
-                            note = (note + " · " if note else "") + \
-                                f"differs from the SS/Amb sheet ({sheet['date_raw']})"
-                elif sheet["state"] in ("RELEASED", "NOT YET RELEASED", "CHECK"):
-                    state, date_raw = sheet["state"], sheet["date_raw"]
-                    note = ("not in the Zenith list — using the SS/Amb sheet date"
-                            + (" · " + sheet["note"] if sheet["note"] else ""))
-                else:
-                    state, date_raw, note = "NOT FOUND", "", "not in the Zenith list or the SS/Amb sheets"
+                # The aggregator prefix names the channel the game is opened
+                # through — that channel's own source decides the date. The
+                # other source rides along as cross-check context.
+                def _usable(res):
+                    return (res.get("date_raw")
+                            and res.get("state") not in ("NOT FOUND", "NO SOURCE", "ERROR", "SKIPPED", "STATUS")
+                            and _parse_any_date(res["date_raw"])[0] is not None)
 
-                looked.append({**r, "state": state, "date_raw": date_raw, "note": note,
+                zen_label = "Zenith"
+                sheet_label = f"{sheet.get('doc', 'provider')} document"
+                if channel == "Zenith":
+                    routed, other = zen, sheet
+                    routed_label, other_label = zen_label, sheet_label
+                elif channel in ("SS", "Amb"):
+                    routed, other = sheet, zen
+                    routed_label, other_label = sheet_label, zen_label
+                else:  # no prefix pasted — no channel to route by
+                    routed, other = None, None
+                    routed_label = other_label = ""
+
+                if routed is not None and _usable(routed):
+                    state, date_raw, note, src = routed["state"], routed["date_raw"], routed["note"], routed_label
+                    if _usable(other):
+                        rd, _p1 = _parse_any_date(routed["date_raw"])
+                        od, _p2 = _parse_any_date(other["date_raw"])
+                        if rd != od:
+                            note = (note + " · " if note else "") + f"{other_label}: {other['date_raw']}"
+                elif routed is not None and _usable(other):
+                    state, date_raw, src = other["state"], other["date_raw"], f"{other_label} (fallback)"
+                    reason = routed.get("note") or f"no date in the {routed_label}"
+                    note = f"{reason} — using {other_label}"
+                    if other["note"]:
+                        note += " · " + other["note"]
+                elif routed is None:
+                    # No channel prefix: show whichever sources know the game.
+                    best = zen if _usable(zen) else sheet if _usable(sheet) else None
+                    if best is not None:
+                        state, date_raw = best["state"], best["date_raw"]
+                        src = (zen_label if best is zen else sheet_label) + " (no aggregator pasted)"
+                        note = best["note"]
+                        rest = sheet if best is zen else zen
+                        if _usable(rest):
+                            note = (note + " · " if note else "") + \
+                                f"{sheet_label if best is zen else zen_label}: {rest['date_raw']}"
+                    else:
+                        state, date_raw, src = "NOT FOUND", "", ""
+                        note = "not in Zenith or the provider documents — search the internet"
+                else:
+                    state, date_raw, src = "NOT FOUND", "", ""
+                    notes = [x for x in (routed.get("note"), other.get("note")) if x]
+                    note = (" · ".join(notes) + " — " if notes else "") + "search the internet"
+
+                looked.append({**r, "state": state, "date_raw": date_raw, "note": note, "src": src,
                                "sheet_date": sheet["date_raw"], "zen_date": zen["date_raw"]})
             active = [r for r in looked if not r.get("empty") and not r.get("header")]
 
@@ -944,8 +1080,9 @@ with tab_batch:
                 "Game": r["game"],
                 "Provider": r.get("provider_raw") or r.get("provider", ""),
                 "Zenith date": r.get("zen_date", ""),
-                "SS/Amb date": r.get("sheet_date", ""),
+                "Provider doc date": r.get("sheet_date", ""),
                 "Status": r["state"],
+                "Date from": r.get("src", ""),
                 "Note": r["note"],
                 "Web": google_search_url(f"{r['game']} {r.get('provider', '')} release date")
                        if r["state"] == "NOT FOUND" else "",
@@ -970,9 +1107,12 @@ with tab_batch:
                     conv_lines.append(to_sheet_date(r["date_raw"]))
             st.markdown(
                 "**Convert & copy dates column** — one line per pasted row, in the "
-                "same order, sheet date format (`Fri, 10/07`). Zenith date when the "
-                "game is in the Zenith list, otherwise the SS/Amb sheet date. Use "
-                "the copy icon, then paste straight back into the sync sheet:"
+                "same order, sheet date format (`Fri, 10/07`). Each row's date "
+                "comes from its own aggregator channel (`zen:` → Zenith, `SS:`/"
+                "`amb:` → that aggregator's provider document), falling back to "
+                "the other source when the channel has no date — the “Date from” "
+                "column says which. Use the copy icon, then paste straight back "
+                "into the sync sheet:"
             )
             st.code("\n".join(conv_lines), language=None)
             st.markdown("**Copy dates column** — dates exactly as the source shows them:")

@@ -2,6 +2,28 @@
 
 Internal tool for looking up game release dates.
 
+## How dates are resolved (channel routing)
+
+S5 opens games through provider **aggregators** — Zenith (currently LATAM)
+and SS (currently Asia), with Amb ready to configure. Both aggregators can
+carry the same brands (JILI and TaDa are two labels of one underlying
+provider), and the same game gets a different release date per channel. The
+aggregator prefix in the sync sheet's provider cell (`zen:` / `SS:` /
+`amb:`) names the channel a game is opened through, so **that channel's own
+source decides its date**:
+
+- `zen: X` rows → the Zenith list answers; the provider document is context.
+- `SS: X` / `amb: X` rows → that aggregator's provider document answers;
+  Zenith is context.
+- When the routed channel has no usable date (e.g. the JILI document lists
+  a game as “Customer Limited”), the other source's date is used and marked
+  as a fallback in the “Date from” column; when nothing has it, the row
+  says to search the internet.
+
+JILI ≡ TaDa is built in (`BRAND_FAMILIES` in app.py) — vendor matching
+never flags them against each other, and a TaDa row may resolve via the
+JILI document or vice versa.
+
 ## Batch check (default tab)
 
 Paste rows straight from the weekly game sync sheet — the provider cell
@@ -23,8 +45,11 @@ The **Convert & copy dates column** block gives one line per pasted row in
 the sync-sheet date format (`Fri, 10/07`) — Zenith date when available,
 otherwise the SS/Amb sheet date — ready to paste back into the sheet.
 
-**Monthly update:** replace `zenith_gamelist.csv` with the new ONEAPI export
-and push (a fresh export can also be uploaded in the UI for one session).
+**Zenith data source priority:** uploaded CSV (session) → **live Airtable**
+(when `AIRTABLE_TOKEN` is set in Streamlit Cloud → App → Settings → Secrets;
+needs `data.records:read` on the ONEAPI base) → bundled
+`zenith_gamelist.csv`. With the token set there is nothing to update
+monthly; the bundled CSV remains as the no-setup fallback.
 
 ## Input sources panel
 
