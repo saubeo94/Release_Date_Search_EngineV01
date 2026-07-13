@@ -44,6 +44,41 @@ def fetch_sheet(sheet_id: str, gid: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(resp.text), dtype=str).fillna("")
 
 
+def airtable_records_to_df(records: list[dict]) -> pd.DataFrame:
+    """Flatten Airtable API records (list of {'fields': {...}}) into a DataFrame."""
+    rows = [
+        {k: _cell_to_text(v) for k, v in rec.get("fields", {}).items()}
+        for rec in records
+    ]
+    if not rows:
+        raise RuntimeError("Airtable view returned no rows.")
+    return pd.DataFrame(rows).fillna("")
+
+
+def fetch_zenith_df() -> tuple[pd.DataFrame, str]:
+    """Fetch Zenith data, trying each source in the documented priority order.
+
+    1. Mirror Google Sheet (ZENITH_SHEET_ID secret)
+    2. Airtable API (AIRTABLE_TOKEN secret)
+    3. Built-in shared-view reader (no setup needed)
+
+    Returns (dataframe, source label). Raises if every source fails.
+    """
+    sheet_id = st.secrets.get("ZENITH_SHEET_ID", "").strip()
+    if sheet_id:
+        gid = st.secrets.get("ZENITH_SHEET_GID", "0").strip() or "0"
+        return fetch_sheet(sheet_id, gid), "mirror sheet"
+
+    try:
+        records = fetch_airtable()
+        return airtable_records_to_df(records), "Airtable API"
+    except RuntimeError as exc:
+        if str(exc) != "missing-token":
+            raise
+
+    return fetch_shared_view(), "shared view"
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_airtable() -> list[dict]:
     """Download all records from the Zenith Airtable view (needs API token)."""
@@ -398,16 +433,16 @@ providers = (
 # "Amb" option and the Zenith button matches the gap between SS and Amb.
 with st.container(border=True):
     st.markdown("Aggregator")
-    radio_col, btn_col, spacer = st.columns([1.1, 0.9, 3])
+    radio_col, btn_col, spacer = st.columns([1.6, 1.4, 2])
     with radio_col:
         aggregator = st.radio(
-            "Aggregator", ["SS", "Amb"], horizontal=True,
+            "Aggregator", ["SS", "Amb", "Zenith"], horizontal=True,
             label_visibility="collapsed",
         )
     with btn_col:
         st.markdown(
             f'<a class="zenith-btn" href="{AIRTABLE_SHARED_URL}" target="_blank">'
-            "Zenith</a>",
+            "Open Airtable ↗</a>",
             unsafe_allow_html=True,
         )
 
@@ -451,8 +486,8 @@ if st.button("Search", type="primary"):
                 st.success(f"{len(display)} match(es) found")
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------------------------- Amb
-    else:
+    # ---------------------------------------------------------------- Amb
+    elif aggregator == "Amb":
         key = provider.strip().lower()
         if key not in AMB_SHEETS:
             st.warning(
@@ -470,6 +505,18 @@ if st.button("Search", type="primary"):
                     f"Could not read the Amb source ({exc}). Make sure it is "
                     "shared as “anyone with the link can view”."
                 )
+
+    # ------------------------------------------------------------- Zenith
+    else:
+        try:
+            with st.spinner("Fetching Zenith (Airtable) data…"):
+                df, source = fetch_zenith_df()
+            show_df_hits(df, game_name, f"Zenith — {source}")
+        except Exception as exc:
+            st.error(
+                f"Couldn't fetch Zenith data automatically ({exc}). Use the "
+                "**Open Airtable** button above to look it up manually."
+            )
 
     # ------------------------------------------------------- internet section
     with st.container(border=True):

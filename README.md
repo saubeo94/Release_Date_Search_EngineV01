@@ -1,7 +1,7 @@
 # Release date finder
 
 Internal tool for looking up game release dates. Enter a game name, pick the
-provider, choose the aggregator (SS or Zenith), and the app fetches the
+provider, choose the aggregator (SS, Amb, or Zenith), and the app fetches the
 release date live from the right source:
 
 | Aggregator | Provider | Source |
