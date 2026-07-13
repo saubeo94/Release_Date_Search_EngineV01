@@ -33,6 +33,33 @@ AIRTABLE_SHARED_URL = (
 
 RELEASE_DATE_COLUMN = 2  # column C in both SS sheets
 
+# Google Sheets links shown in (and editable from) the "Input sources" panel.
+_SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
+_GID_RE = re.compile(r"[#?&]gid=(\d+)")
+
+
+def parse_sheet_url(url: str):
+    """Extract (sheet_id, gid) from a Google Sheets link; gid defaults to 0."""
+    m = _SHEET_URL_RE.search(url or "")
+    if not m:
+        return None, None
+    g = _GID_RE.search(url)
+    return m.group(1), (g.group(1) if g else "0")
+
+
+def sheet_edit_url(sheet_id: str, gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit?gid={gid}#gid={gid}"
+
+
+def find_source(provider: str, sources: dict):
+    """Match a detected provider against configured source slots (fuzzy)."""
+    pv = _norm_vendor(provider)
+    for prov_key, cfg in sources.items():
+        pk = _norm_vendor(prov_key)
+        if pk and pv and (pk == pv or pk in pv or pv in pk):
+            return prov_key, cfg
+    return None, None
+
 
 # ------------------------------------------------------------------- fetchers
 
@@ -535,23 +562,17 @@ def _pick_col(df: pd.DataFrame, want: str, avoid: tuple = ()):
     return None
 
 
-def batch_lookup(game: str, provider: str) -> dict:
-    """Look one parsed row up in the configured SS sheets."""
+def batch_lookup(game: str, provider: str, sources: dict) -> dict:
+    """Look one parsed row up in the configured provider sheets."""
     if not _norm_name(game):
         return {"state": "SKIPPED", "date_raw": "", "note": "couldn't read a game name"}
-    pv = _norm_vendor(provider)
-    source = None
-    for prov_key, cfg in SS_SHEETS.items():
-        pk = _norm_vendor(prov_key)
-        if pk and pv and (pk == pv or pk in pv or pv in pk):
-            source = (prov_key, cfg)
-            break
-    if source is None:
+    prov_key, cfg = find_source(provider, sources)
+    if cfg is None:
         return {
             "state": "NO SOURCE", "date_raw": "",
             "note": f"no sheet configured for “{provider}” — use the web link",
         }
-    prov_key, (sheet_id, gid, tab) = source
+    sheet_id, gid, tab = cfg
     try:
         df = fetch_sheet_smart(sheet_id, gid)
     except requests.RequestException as exc:
@@ -738,6 +759,93 @@ providers = (
 )
 vendor_keys = [v for v in (_norm_vendor(p) for p in providers) if len(v) >= 2]
 
+# ------------------------------------------------------------- input sources
+# Every place the app reads release dates from, shown to the user and
+# editable: the Zenith CSV plus one link slot per provider document.
+
+if "sources" not in st.session_state:
+    st.session_state.sources = [
+        {"aggregator": "SS", "provider": "JILI",
+         "url": sheet_edit_url(*SS_SHEETS["jili"][:2])},
+        {"aggregator": "SS", "provider": "TaDa",
+         "url": sheet_edit_url(*SS_SHEETS["tada"][:2])},
+    ]
+
+zenith_df, zenith_src, zenith_error = None, "", ""
+with st.expander("Input sources — where the release dates come from"):
+    st.markdown(
+        "**Zenith** — monthly “ONEAPI Updated Game List” Airtable export, "
+        "bundled with the app. Upload a fresh export to use it for this session:"
+    )
+    uploaded = st.file_uploader("Fresh ONEAPI export", type="csv", key="zenith_upload",
+                                label_visibility="collapsed")
+    if uploaded is not None:
+        try:
+            zenith_df = parse_zenith_csv(uploaded.getvalue().decode("utf-8-sig"))
+            zenith_src = "uploaded CSV (this session only)"
+        except Exception as exc:  # noqa: BLE001 — show any parse problem
+            st.error(f"Couldn't read that CSV: {exc}")
+    st.markdown(
+        "**Provider documents (SS / Amb)** — the release-date sheets the "
+        "providers publish. Paste a Google Sheets link (including the tab's "
+        "`gid=`) to repoint a slot, or add another provider's document:"
+    )
+    for i, src in enumerate(st.session_state.sources):
+        c_agg, c_prov, c_url = st.columns([1.0, 1.4, 4.0])
+        src["aggregator"] = c_agg.selectbox(
+            "Aggregator", ["SS", "Amb"],
+            index=["SS", "Amb"].index(src.get("aggregator", "SS")),
+            key=f"src_agg_{i}", label_visibility="collapsed",
+        )
+        src["provider"] = c_prov.text_input(
+            "Provider", value=src.get("provider", ""), key=f"src_prov_{i}",
+            placeholder="Provider", label_visibility="collapsed",
+        )
+        src["url"] = c_url.text_input(
+            "Sheet link", value=src.get("url", ""), key=f"src_url_{i}",
+            placeholder="https://docs.google.com/spreadsheets/d/…?gid=…",
+            label_visibility="collapsed",
+        )
+        if src["url"] and parse_sheet_url(src["url"])[0] is None:
+            st.warning(f"Slot {i + 1}: that doesn't look like a Google Sheets link.")
+    if st.button("Add a source slot", key="add_source"):
+        st.session_state.sources.append({"aggregator": "SS", "provider": "", "url": ""})
+        st.rerun()
+
+if zenith_df is None:
+    try:
+        zenith_df = load_zenith_bundled()
+        zenith_src = "bundled monthly export"
+    except Exception as exc:  # noqa: BLE001
+        zenith_error = str(exc)
+
+
+def build_sources(aggregator=None) -> dict:
+    out = {}
+    for s in st.session_state.sources:
+        if aggregator and s.get("aggregator") != aggregator:
+            continue
+        sid, gid = parse_sheet_url(s.get("url", ""))
+        prov = s.get("provider", "").strip()
+        if prov and sid:
+            out[prov] = (sid, gid, f"{prov} ({s.get('aggregator', 'SS')})")
+    return out
+
+
+eff_all, eff_ss, eff_amb = build_sources(), build_sources("SS"), build_sources("Amb")
+
+source_bits = []
+if zenith_df is not None:
+    source_bits.append(f"Zenith list: {len(zenith_df):,} games ({zenith_src})")
+for s in st.session_state.sources:
+    sid, gid = parse_sheet_url(s.get("url", ""))
+    if s.get("provider", "").strip() and sid:
+        source_bits.append(f"[{s['provider']} sheet ({s['aggregator']})]({sheet_edit_url(sid, gid)})")
+st.caption("Information comes from — " + " · ".join(source_bits)
+           if source_bits else "No sources configured yet.")
+if zenith_df is None:
+    st.warning(f"Zenith list unavailable ({zenith_error}) — cross-check will use the provider sheets only.")
+
 tab_batch, tab_single = st.tabs(["Batch check", "Single game"])
 
 # ----------------------------------------------------------- batch check tab
@@ -749,28 +857,6 @@ with tab_batch:
         "read from the cell to its left; dates, checkboxes, links and BO-group "
         "cells are ignored."
     )
-    # Zenith list: bundled monthly ONEAPI export, replaceable for the session.
-    zenith_df, zenith_src = None, ""
-    zenith_error = ""
-    with st.expander("Zenith list (ONEAPI CSV) — bundled, replace here if you have a newer export"):
-        uploaded = st.file_uploader("Fresh ONEAPI export", type="csv", key="zenith_upload")
-        if uploaded is not None:
-            try:
-                zenith_df = parse_zenith_csv(uploaded.getvalue().decode("utf-8-sig"))
-                zenith_src = "uploaded CSV (this session only)"
-            except Exception as exc:  # noqa: BLE001 — show any parse problem
-                st.error(f"Couldn't read that CSV: {exc}")
-    if zenith_df is None:
-        try:
-            zenith_df = load_zenith_bundled()
-            zenith_src = "bundled monthly export"
-        except Exception as exc:  # noqa: BLE001
-            zenith_error = str(exc)
-    if zenith_df is not None:
-        st.caption(f"Zenith list: {len(zenith_df):,} games ({zenith_src})")
-    else:
-        st.warning(f"Zenith list unavailable ({zenith_error}) — cross-check will use SS/Amb sheets only.")
-
     pasted = st.text_area(
         "Sync sheet rows", height=160, key="batch_input",
         placeholder="Fri, 19/06\tSuper Ace\tSS: Jili\tBRKZ\nFri, 19/06\tLucky Tamarin\tSS: Tada\tBRKZ",
@@ -787,7 +873,7 @@ with tab_batch:
                     looked.append({**r, "state": "", "date_raw": "", "sheet_date": "",
                                    "note": "header row" if r.get("header") else ""})
                     continue
-                sheet = batch_lookup(r["game"], r["provider"])
+                sheet = batch_lookup(r["game"], r["provider"], eff_all)
                 zen = (zenith_lookup(r["game"], r["provider"], zenith_df)
                        if zenith_df is not None
                        else {"state": "NOT FOUND", "date_raw": "", "note": ""})
@@ -893,14 +979,15 @@ with tab_single:
 
         # -------------------------------------------------------------------- SS
         if aggregator == "SS":
-            key = provider.strip().lower()
-            if key not in SS_SHEETS:
+            _, cfg = find_source(provider, eff_ss)
+            if cfg is None:
                 st.warning(
-                    f"No SS sheet is configured for **{provider}** — only JILI and "
-                    "TaDa have SS sources. Try the internet search below."
+                    f"No SS document is configured for **{provider}** — add its "
+                    "sheet link under “Input sources” above, or try the internet "
+                    "search below."
                 )
             else:
-                sheet_id, gid, tab = SS_SHEETS[key]
+                sheet_id, gid, tab = cfg
                 try:
                     with st.spinner(f"Fetching “{tab}” sheet…"):
                         df = fetch_sheet(sheet_id, gid)
@@ -925,14 +1012,15 @@ with tab_single:
 
         # ------------------------------------------------------------------- Amb
         else:
-            key = provider.strip().lower()
-            if key not in AMB_SHEETS:
+            _, cfg = find_source(provider, eff_amb)
+            if cfg is None:
                 st.warning(
-                    f"No Amb source is configured yet for **{provider}**. "
-                    "Use the internet search below in the meantime."
+                    f"No Amb document is configured yet for **{provider}** — add "
+                    "its sheet link under “Input sources” above. Use the internet "
+                    "search below in the meantime."
                 )
             else:
-                sheet_id, gid, tab = AMB_SHEETS[key]
+                sheet_id, gid, tab = cfg
                 try:
                     with st.spinner(f"Fetching “{tab}” sheet…"):
                         df = fetch_sheet(sheet_id, gid)

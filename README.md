@@ -26,6 +26,21 @@ otherwise the SS/Amb sheet date — ready to paste back into the sheet.
 **Monthly update:** replace `zenith_gamelist.csv` with the new ONEAPI export
 and push (a fresh export can also be uploaded in the UI for one session).
 
+## Input sources panel
+
+The "Input sources — where the release dates come from" panel (above the
+tabs) shows every place the app reads from, with clickable links, so users
+can see and verify the origin of the data:
+
+- **Zenith** — the bundled ONEAPI CSV, with a session-only upload override.
+- **Provider documents** — one slot per provider sheet (JILI and TaDa by
+  default, the release-date documents they publish under SS). Paste a new
+  Google Sheets link (must include the tab's `gid=`) to repoint a slot, or
+  click **Add a source slot** to register another provider's document —
+  both tabs use these slots for lookups. Sheets must be shared as "anyone
+  with the link can view". Slot edits last for the session; change the
+  defaults in `app.py` (`SS_SHEETS`) to make them permanent.
+
 ## Single game tab
 
 Enter a game name, pick the provider, choose the aggregator (SS or Zenith),
