@@ -1,8 +1,35 @@
 # Release date finder
 
-Internal tool for looking up game release dates. Enter a game name, pick the
-provider, choose the aggregator (SS or Zenith), and the app fetches the
-release date live from the right source:
+Internal tool for looking up game release dates.
+
+## Batch check (default tab)
+
+Paste rows straight from the weekly game sync sheet — the provider cell
+(e.g. `SS: Tada`) is detected automatically and the game name is read from
+the cell to its left. Every game is looked up in **two places at once** and
+shown side by side for cross-checking:
+
+- **Zenith list** — the bundled `zenith_gamelist.csv` (a monthly "ONEAPI
+  Updated Game List — All Game" Airtable export, ~4,700 games, all
+  providers). Duplicate add/remove/re-add history is resolved: the latest
+  Added/Up Coming/Change row gives the date, a later removal flags
+  **REMOVED**, same-day add+remove flags **CHECK**. Dates after today flag
+  **NOT YET RELEASED** with a countdown and a red "do not open on MP" banner.
+- **SS/Amb sheets** — the live JILI / TaDa Google Sheets (provider release
+  dates), shown in their own column; a note appears when the two sources
+  disagree.
+
+The **Convert & copy dates column** block gives one line per pasted row in
+the sync-sheet date format (`Fri, 10/07`) — Zenith date when available,
+otherwise the SS/Amb sheet date — ready to paste back into the sheet.
+
+**Monthly update:** replace `zenith_gamelist.csv` with the new ONEAPI export
+and push (a fresh export can also be uploaded in the UI for one session).
+
+## Single game tab
+
+Enter a game name, pick the provider, choose the aggregator (SS or Zenith),
+and the app fetches the release date live from the right source:
 
 | Aggregator | Provider | Source |
 |---|---|---|

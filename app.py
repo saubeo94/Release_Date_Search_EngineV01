@@ -583,6 +583,124 @@ def batch_lookup(game: str, provider: str) -> dict:
     return {"state": "RELEASED", "date_raw": date_raw, "note": note}
 
 
+# ------------------------------------------- Zenith list (ONEAPI CSV export)
+# The Zenith Airtable has no reliable live endpoint, so the batch check uses
+# a bundled monthly export instead: replace zenith_gamelist.csv with the new
+# "ONEAPI Updated Game List — All Game" CSV and push. A fresh export can also
+# be uploaded in the UI for the current session.
+
+ZENITH_CSV_PATH = "zenith_gamelist.csv"
+
+
+def parse_zenith_csv(text: str) -> pd.DataFrame:
+    """Normalize an ONEAPI export to name/vendor/date/status columns."""
+    df = pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+
+    def find(pattern):
+        for c in df.columns:
+            if re.search(pattern, str(c).lower()):
+                return c
+        return None
+
+    h_name, h_vendor = find(r"game\s*name"), find(r"vendor|provider")
+    h_date, h_status = find(r"release"), find(r"status")
+    if not h_name or not h_vendor or not h_date:
+        raise ValueError(
+            "The CSV must include Game Name, Vendor and Released Date columns."
+        )
+    out = pd.DataFrame({
+        "name": df[h_name].str.strip(),
+        "vendor": df[h_vendor].str.strip(),
+        "date": df[h_date].str.strip(),
+        "status": df[h_status].str.strip() if h_status else "",
+    })
+    out = out[out["name"] != ""].reset_index(drop=True)
+    out["_name"] = out["name"].map(_norm_name)
+    out["_vendor"] = out["vendor"].map(_norm_vendor)
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_zenith_bundled() -> pd.DataFrame:
+    with open(ZENITH_CSV_PATH, encoding="utf-8-sig") as f:
+        return parse_zenith_csv(f.read())
+
+
+def _zen_classify(s: str) -> str:
+    t = str(s or "")
+    if re.search(r"removed|下架", t, re.I):
+        return "removed"
+    if re.search(r"added|上架", t, re.I):
+        return "added"
+    if re.search(r"up\s*coming|即将", t, re.I):
+        return "upcoming"
+    if re.search(r"change", t, re.I):
+        return "change"
+    return "other"
+
+
+def zenith_lookup(game: str, provider: str, zdf: pd.DataFrame) -> dict:
+    """Resolve a game against the Zenith list. The same game+vendor can appear
+    several times (added / removed / re-added), so the latest event wins:
+    latest Added/Up Coming/Change row gives the date; a later Removal flags
+    REMOVED; both on the same date flags CHECK."""
+    target = _norm_name(game)
+    if not target:
+        return {"state": "SKIPPED", "date_raw": "", "note": "couldn't read a game name"}
+
+    pool = zdf[zdf["_name"] == target]
+    if pool.empty:
+        return {"state": "NOT FOUND", "date_raw": "", "note": "not in the Zenith list"}
+
+    vendor_note = ""
+    pv = _norm_vendor(provider)
+    if pv:
+        exact = pool[pool["_vendor"] == pv]
+        if exact.empty:
+            fuzzy = pool[pool["_vendor"].map(
+                lambda rv: bool(rv) and (rv in pv or pv in rv)
+            )]
+        else:
+            fuzzy = exact
+        if not fuzzy.empty:
+            pool = fuzzy
+        else:
+            listed = ", ".join(sorted(set(pool["vendor"])))
+            vendor_note = f"provider mismatch — Zenith has it under: {listed}"
+
+    events = []
+    for _, r in pool.iterrows():
+        d, _prec = _parse_any_date(r["date"])
+        if d:
+            events.append((d, _zen_classify(r["status"]), r["date"]))
+    if not events:
+        res = {"state": "NO DATE", "date_raw": "", "note": "no valid date in the Zenith list"}
+    else:
+        added = [e for e in events if e[1] in ("added", "upcoming", "change")]
+        removed = [e for e in events if e[1] == "removed"]
+        primary = max(added or events, key=lambda e: e[0])
+        last_removed = max(removed, key=lambda e: e[0]) if removed else None
+        if last_removed and added and last_removed[0] == primary[0]:
+            res = {"state": "CHECK", "date_raw": primary[2],
+                   "note": "added and removed on the same date — verify manually"}
+        elif last_removed and (not added or last_removed[0] > primary[0]):
+            res = {"state": "REMOVED", "date_raw": last_removed[2],
+                   "note": f"removed {last_removed[2]}"}
+        elif primary[0] > date.today():
+            days = (primary[0] - date.today()).days
+            res = {"state": "NOT YET RELEASED", "date_raw": primary[2],
+                   "note": f"releases in {days} day{'s' if days != 1 else ''}"}
+        else:
+            res = {"state": "RELEASED", "date_raw": primary[2], "note": ""}
+        if primary[1] == "change":
+            res["note"] = (res["note"] + " · " if res["note"] else "") + "listed as code/name change"
+    if vendor_note:
+        res["note"] = vendor_note + (" · " + res["note"] if res["note"] else "")
+        if res["state"] == "RELEASED":
+            res["state"] = "CHECK"
+    return res
+
+
 # ------------------------------------------------------------------------- ui
 
 st.set_page_config(page_title="Release date finder", page_icon="🎰", layout="centered")
@@ -631,6 +749,28 @@ with tab_batch:
         "read from the cell to its left; dates, checkboxes, links and BO-group "
         "cells are ignored."
     )
+    # Zenith list: bundled monthly ONEAPI export, replaceable for the session.
+    zenith_df, zenith_src = None, ""
+    zenith_error = ""
+    with st.expander("Zenith list (ONEAPI CSV) — bundled, replace here if you have a newer export"):
+        uploaded = st.file_uploader("Fresh ONEAPI export", type="csv", key="zenith_upload")
+        if uploaded is not None:
+            try:
+                zenith_df = parse_zenith_csv(uploaded.getvalue().decode("utf-8-sig"))
+                zenith_src = "uploaded CSV (this session only)"
+            except Exception as exc:  # noqa: BLE001 — show any parse problem
+                st.error(f"Couldn't read that CSV: {exc}")
+    if zenith_df is None:
+        try:
+            zenith_df = load_zenith_bundled()
+            zenith_src = "bundled monthly export"
+        except Exception as exc:  # noqa: BLE001
+            zenith_error = str(exc)
+    if zenith_df is not None:
+        st.caption(f"Zenith list: {len(zenith_df):,} games ({zenith_src})")
+    else:
+        st.warning(f"Zenith list unavailable ({zenith_error}) — cross-check will use SS/Amb sheets only.")
+
     pasted = st.text_area(
         "Sync sheet rows", height=160, key="batch_input",
         placeholder="Fri, 19/06\tSuper Ace\tSS: Jili\tBRKZ\nFri, 19/06\tLucky Tamarin\tSS: Tada\tBRKZ",
@@ -644,19 +784,43 @@ with tab_batch:
             looked = []
             for r in parsed:
                 if r.get("empty") or r.get("header"):
-                    looked.append({**r, "state": "", "date_raw": "",
+                    looked.append({**r, "state": "", "date_raw": "", "sheet_date": "",
                                    "note": "header row" if r.get("header") else ""})
+                    continue
+                sheet = batch_lookup(r["game"], r["provider"])
+                zen = (zenith_lookup(r["game"], r["provider"], zenith_df)
+                       if zenith_df is not None
+                       else {"state": "NOT FOUND", "date_raw": "", "note": ""})
+
+                # Zenith is the platform truth for opening games on MP, so its
+                # verdict wins; the SS/Amb sheet date rides along as cross-check.
+                if zen["state"] not in ("NOT FOUND", "SKIPPED"):
+                    state, date_raw, note = zen["state"], zen["date_raw"], zen["note"]
+                    if sheet["state"] in ("RELEASED", "NOT YET RELEASED", "CHECK") and sheet["date_raw"]:
+                        zd, _ = _parse_any_date(zen["date_raw"])
+                        sd, _ = _parse_any_date(sheet["date_raw"])
+                        if zd and sd and zd != sd:
+                            note = (note + " · " if note else "") + \
+                                f"differs from the SS/Amb sheet ({sheet['date_raw']})"
+                elif sheet["state"] in ("RELEASED", "NOT YET RELEASED", "CHECK"):
+                    state, date_raw = sheet["state"], sheet["date_raw"]
+                    note = ("not in the Zenith list — using the SS/Amb sheet date"
+                            + (" · " + sheet["note"] if sheet["note"] else ""))
                 else:
-                    looked.append({**r, **batch_lookup(r["game"], r["provider"])})
+                    state, date_raw, note = "NOT FOUND", "", "not in the Zenith list or the SS/Amb sheets"
+
+                looked.append({**r, "state": state, "date_raw": date_raw, "note": note,
+                               "sheet_date": sheet["date_raw"], "zen_date": zen["date_raw"]})
             active = [r for r in looked if not r.get("empty") and not r.get("header")]
 
             n_notyet = sum(1 for r in active if r["state"] == "NOT YET RELEASED")
             n_rel = sum(1 for r in active if r["state"] == "RELEASED")
+            n_rem = sum(1 for r in active if r["state"] == "REMOVED")
+            n_chk = sum(1 for r in active if r["state"] in ("CHECK", "NO DATE"))
             n_miss = sum(1 for r in active if r["state"] == "NOT FOUND")
-            n_nosrc = sum(1 for r in active if r["state"] == "NO SOURCE")
             st.markdown(
                 f"**{len(active)} games** — {n_rel} released · {n_notyet} not yet "
-                f"released · {n_miss} not found · {n_nosrc} no source"
+                f"released · {n_rem} removed · {n_chk} check manually · {n_miss} not found"
             )
             if n_notyet:
                 st.error(f"⚠ {n_notyet} game(s) are not released yet — do not open on MP.")
@@ -664,11 +828,12 @@ with tab_batch:
             table = pd.DataFrame([{
                 "Game": r["game"],
                 "Provider": r.get("provider_raw") or r.get("provider", ""),
-                "Release date": r["date_raw"],
+                "Zenith date": r.get("zen_date", ""),
+                "SS/Amb date": r.get("sheet_date", ""),
                 "Status": r["state"],
                 "Note": r["note"],
                 "Web": google_search_url(f"{r['game']} {r.get('provider', '')} release date")
-                       if r["state"] in ("NOT FOUND", "NO SOURCE") else "",
+                       if r["state"] == "NOT FOUND" else "",
             } for r in active])
             st.dataframe(
                 table, use_container_width=True, hide_index=True,
@@ -682,7 +847,7 @@ with tab_batch:
                     # which would break the one-line-per-pasted-row alignment
                     conv_lines.append(" ")
                     raw_lines.append(" ")
-                elif r["state"] in ("NOT FOUND", "NO SOURCE", "SKIPPED", "ERROR"):
+                elif not r["date_raw"]:
                     conv_lines.append(r["state"])
                     raw_lines.append(r["state"])
                 else:
@@ -690,8 +855,9 @@ with tab_batch:
                     conv_lines.append(to_sheet_date(r["date_raw"]))
             st.markdown(
                 "**Convert & copy dates column** — one line per pasted row, in the "
-                "same order, sheet date format (`Fri, 10/07`). Use the copy icon, "
-                "then paste straight back into the sync sheet:"
+                "same order, sheet date format (`Fri, 10/07`). Zenith date when the "
+                "game is in the Zenith list, otherwise the SS/Amb sheet date. Use "
+                "the copy icon, then paste straight back into the sync sheet:"
             )
             st.code("\n".join(conv_lines), language=None)
             st.markdown("**Copy dates column** — dates exactly as the source shows them:")
