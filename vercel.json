@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/zenith.js": {
-      "maxDuration": 60
-    }
-  }
-}

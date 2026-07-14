@@ -1,7 +1,3 @@
-node_modules
-dist
-.DS_Store
-.vercel
-.streamlit/
+.streamlit/secrets.toml
 __pycache__/
 *.pyc

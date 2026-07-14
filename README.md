@@ -1,71 +1,176 @@
-# Release Date Checker
+# Release date finder
 
-Internal DX tool: paste rows from the weekly game sync sheet, look up each game's
-release date, and copy the dates back — with warnings for games that are **not yet
-released** (do not open on MP), removed, or not found.
+Internal tool for looking up game release dates.
 
 ## How dates are resolved (channel routing)
 
-S5 opens games through provider aggregators — Zenith (currently LATAM) and SS
-(currently Asia), with Amb ready to configure. The same game gets a different
-release date per channel, and the aggregator prefix in the sync sheet's provider
-cell names the channel, so that channel's own source decides each row's date:
+S5 opens games through provider **aggregators** — Zenith (currently LATAM)
+and SS (currently Asia), with Amb ready to configure. Both aggregators can
+carry the same brands (JILI and TaDa are two labels of one underlying
+provider), and the same game gets a different release date per channel. The
+aggregator prefix in the sync sheet's provider cell (`zen:` / `SS:` /
+`amb:`) names the channel a game is opened through, so **that channel's own
+source decides its date**:
 
-- `zen: X` rows → the **Zenith list** answers; provider documents are context.
-- `SS: X` / `amb: X` rows → that aggregator's **provider document** (live Google
-  Sheet, e.g. the TaDa/JILI release-date docs) answers; Zenith is context.
-- When the routed channel has no usable date (e.g. JILI lists a game as
-  "Customer Limited"), the other source's date is used and marked as a fallback
-  — every result row shows a "from …" tag naming its source.
+- `zen: X` rows → the Zenith list answers; the provider document is context.
+- `SS: X` / `amb: X` rows → that aggregator's provider document answers;
+  Zenith is context.
+- When the routed channel has no usable date (e.g. the JILI document lists
+  a game as “Customer Limited”), the other source's date is used and marked
+  as a fallback in the “Date from” column; when nothing has it, the row
+  says to search the internet.
 
-JILI ≡ TaDa is declared as one brand family (`BRAND_FAMILIES` in `src/App.jsx`):
-vendor matching never flags them against each other.
+JILI ≡ TaDa is built in (`BRAND_FAMILIES` in app.py) — vendor matching
+never flags them against each other, and a TaDa row may resolve via the
+JILI document or vice versa.
 
-## Data sources
+## Batch check (default tab)
 
-- **Zenith list** priority: uploaded CSV (localStorage, until Clear) → **live
-  Airtable** via the `/api/zenith` serverless function (needs the
-  `AIRTABLE_TOKEN` env var on Vercel; the token never reaches the browser) →
-  bundled `public/gamelist.csv` fallback.
-- **Provider documents**: editable link slots (defaults: JILI + TaDa sheets),
-  persisted in `localStorage`, fetched client-side from Google Sheets' CSV
-  export (sheets must be shared "anyone with the link can view").
+Paste rows straight from the weekly game sync sheet — the provider cell
+(e.g. `SS: Tada`) is detected automatically and the game name is read from
+the cell to its left. Every game is looked up in **two places at once** and
+shown side by side for cross-checking:
 
-## Stack
+- **Zenith list** — the bundled `zenith_gamelist.csv` (a monthly "ONEAPI
+  Updated Game List — All Game" Airtable export, ~4,700 games, all
+  providers). Duplicate add/remove/re-add history is resolved: the latest
+  Added/Up Coming/Change row gives the date, a later removal flags
+  **REMOVED**, same-day add+remove flags **CHECK**. Dates after today flag
+  **NOT YET RELEASED** with a countdown and a red "do not open on MP" banner.
+- **SS/Amb sheets** — the live JILI / TaDa Google Sheets (provider release
+  dates), shown in their own column; a note appears when the two sources
+  disagree.
 
-Vite + React single-page app + one Vercel serverless function (`api/zenith.js`).
-CSV parsing in the browser via papaparse.
+The **Convert & copy dates column** block gives one line per pasted row in
+the sync-sheet date format (`Fri, 10/07`) — Zenith date when available,
+otherwise the SS/Amb sheet date — ready to paste back into the sheet.
 
-## Local development
+**Zenith data source priority:** uploaded CSV (session) → **live Airtable**
+(when `AIRTABLE_TOKEN` is set in Streamlit Cloud → App → Settings → Secrets;
+needs `data.records:read` on the ONEAPI base) → bundled
+`zenith_gamelist.csv`. With the token set there is nothing to update
+monthly; the bundled CSV remains as the no-setup fallback.
+
+## Input sources panel
+
+The "Input sources — where the release dates come from" panel (above the
+tabs) shows every place the app reads from, with clickable links, so users
+can see and verify the origin of the data:
+
+- **Zenith** — the bundled ONEAPI CSV, with a session-only upload override.
+- **Provider documents** — one slot per provider sheet (JILI and TaDa by
+  default, the release-date documents they publish under SS). Paste a new
+  Google Sheets link (must include the tab's `gid=`) to repoint a slot, or
+  click **Add a source slot** to register another provider's document —
+  both tabs use these slots for lookups. Sheets must be shared as "anyone
+  with the link can view". Slot edits last for the session; change the
+  defaults in `app.py` (`SS_SHEETS`) to make them permanent.
+
+## Single game tab
+
+Enter a game name, pick the provider, choose the aggregator (SS or Zenith),
+and the app fetches the release date live from the right source:
+
+| Aggregator | Provider | Source |
+|---|---|---|
+| Zenith | any | Airtable (Zenith game base, via API) |
+| SS | JILI | Google Sheet → "Jili game list" tab, release date in column C |
+| SS | TaDa | Google Sheet → "game list" tab, release date in column C |
+| SS | other | No official source — SlotCatalog search link shown instead |
+
+A "Search SlotCatalog via Google" fallback link is always shown.
+
+## How Zenith data is fetched (source priority)
+
+The app tries these sources in order and uses the first one that works:
+
+1. **Mirror Google Sheet** — if `ZENITH_SHEET_ID` is set in secrets (see below)
+2. **Airtable API** — if `AIRTABLE_TOKEN` is set in secrets
+3. **Built-in shared-view reader** — no setup needed. The app reads the public
+   shared view the same way a browser does, via Airtable's internal
+   `readSharedViewData` endpoint. ⚠️ This endpoint is *undocumented*: Airtable
+   can change or block it at any time, at which point the app automatically
+   falls back to option 4. Don't rely on it as the long-term solution.
+4. **Link button** to the shared Airtable view (manual lookup)
+
+So the app works out of the box with zero Zenith setup (via #3), and you can
+harden it later by adding a mirror sheet (#1) or token (#2).
+
+## Zenith mirror (recommended way to get live Zenith data)
+
+Instead of an Airtable token, mirror the Zenith Airtable into a Google Sheet
+with a free connector, and let the app read the sheet. One-time setup by
+someone who is a collaborator on the Zenith base:
+
+1. **Create an empty Google Sheet** (e.g. "Zenith mirror") and set sharing to
+   "anyone with the link can view".
+2. **Set up the sync** with one of these free tools:
+   - **Data Fetcher** (Airtable extension): in the Zenith base, add the Data
+     Fetcher extension → create an *export* request → destination: Google
+     Sheets → pick your mirror sheet → set a schedule (e.g. daily).
+   - **Coupler.io**: new importer → source: Airtable (paste the shared view
+     URL) → destination: your Google Sheet → schedule it.
+3. **Point the app at the mirror**: in Streamlit Cloud → App → Settings →
+   Secrets, add:
+   ```toml
+   ZENITH_SHEET_ID = "the long id from the sheet URL"
+   ZENITH_SHEET_GID = "0"    # the gid= value of the tab, 0 for the first tab
+   ```
+   Save — the app reboots and Zenith searches now read the mirror.
+
+Source priority for Zenith: mirror sheet → Airtable API token → link to the
+shared view. The app automatically shows any column containing
+"date" / "release" / "launch" first in the results.
+
+## Deploy online for the team (recommended: Streamlit Community Cloud, free)
+
+1. Push this folder to a GitHub repository (public or private):
+   ```bash
+   git remote add origin https://github.com/<your-username>/release-date-finder.git
+   git push -u origin main
+   ```
+2. Go to https://share.streamlit.io, sign in with GitHub, click **New app**,
+   pick this repo, branch `main`, main file `app.py`, and deploy.
+3. **Add the Airtable token** (needed for Zenith lookups):
+   - In Airtable: click your avatar → *Builder hub* → *Personal access tokens*
+     → create a token with the `data.records:read` scope and access to the
+     Zenith base (`appcJn8Ck6R7RTccl`).
+   - In Streamlit Cloud: your app → **Settings → Secrets**, paste:
+     ```toml
+     AIRTABLE_TOKEN = "pat…your token…"
+     ```
+4. Share the app URL (`https://<app-name>.streamlit.app`) with your team.
+   Anyone with the link can use it — no accounts needed.
+
+> Without the token, Zenith searches show a direct link to the shared
+> Airtable view instead of live results. SS (Google Sheets) searches work
+> with no setup, as long as both sheets are shared as
+> "anyone with the link can view".
+
+## Run locally
 
 ```bash
-npm install
-npm run dev
+pip install -r requirements.txt
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # add your token
+streamlit run app.py
 ```
 
-## Monthly game-list update
+## Run in Google Colab (for quick testing only)
 
-With `AIRTABLE_TOKEN` configured, **no monthly update is needed** — Zenith data
-is read live. The bundled CSV only serves as the fallback; refresh it
-occasionally so the fallback stays reasonable:
+```python
+!pip install streamlit -q
+!git clone https://github.com/<your-username>/release-date-finder.git
+%cd release-date-finder
+!streamlit run app.py &>/dev/null &
+# then use a tunnel (e.g. cloudflared or ngrok) to expose port 8501
+```
 
-1. Export the new CSV from Airtable ("ONEAPI Updated Game List — All Game").
-2. Replace `public/gamelist.csv` with the new export.
-3. Bump `public/version.json`:
+Colab links die when the notebook stops, so use Streamlit Cloud for the
+team-facing version.
 
-   ```json
-   { "updated": "2026-08-01", "source": "ONEAPI July 2026 export" }
-   ```
+## Files
 
-4. Commit and push — Vercel auto-redeploys.
-
-## Deploy
-
-A live instance already runs at **https://release-date-checker.vercel.app**
-(deployed from golds5/release-date-checker, with `AIRTABLE_TOKEN` configured).
-
-To host it from this repo instead: import the repo on vercel.com (the Vite
-preset handles the build; `api/zenith.js` deploys as a serverless function
-automatically) and set the `AIRTABLE_TOKEN` environment variable — same token
-as the Streamlit version's secrets, scope `data.records:read` on the ONEAPI
-base. Without the token the app still works, using the bundled CSV fallback.
+- `app.py` — the Streamlit app
+- `game_providers.csv` — provider dropdown list (90 providers)
+- `.streamlit/config.toml` — theme (blue primary button, light background)
+- `.streamlit/secrets.toml.example` — token template (never commit the real one)
