@@ -1,0 +1,110 @@
+/* Grok-style monochrome + Notion-style neutrals; dark is the default theme,
+   html.rdc-light switches to light. The <html> class is the single source of
+   truth (set pre-paint in index.html, toggled by the header button). */
+
+:root {
+  color-scheme: dark;
+  --bg: #0f0f10;
+  --panel: #17181a;
+  --panel-2: #1d1e21;
+  --ink: #ececec;
+  --sub: #9a9aa2;
+  --line: #2a2b2f;
+  --accent: #3ddc97;
+  --link: #8ab4ff;
+  --btn-p-bg: #ececec;
+  --btn-p-fg: #101012;
+  --ok-fg: #3fb950;
+  --ok-bg: rgba(63, 185, 80, 0.14);
+  --warn-fg: #d29922;
+  --warn-bg: rgba(210, 153, 34, 0.15);
+  --danger-fg: #f16572;
+  --danger-bg: rgba(248, 81, 73, 0.14);
+  --danger-solid: #c93544;
+  --danger-row: rgba(248, 81, 73, 0.05);
+  --muted-fg: #8b8b93;
+  --muted-bg: rgba(139, 139, 147, 0.14);
+}
+
+html.rdc-light {
+  color-scheme: light;
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --panel-2: #fbfbfa;
+  --ink: #191919;
+  --sub: #787774;
+  --line: #e7e6e3;
+  --accent: #0e6e58;
+  --link: #28527a;
+  --btn-p-bg: #191919;
+  --btn-p-fg: #ffffff;
+  --ok-fg: #0e6e58;
+  --ok-bg: #e4f1ec;
+  --warn-fg: #9a5b08;
+  --warn-bg: #fbeedb;
+  --danger-fg: #a83240;
+  --danger-bg: #f9e7e9;
+  --danger-solid: #a83240;
+  --danger-row: #fdf4f5;
+  --muted-fg: #5b6470;
+  --muted-bg: #edeff1;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+/* thin, theme-matched scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 99px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button {
+  cursor: pointer;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+button:hover:not(:disabled) {
+  opacity: 0.85;
+}
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+input,
+select,
+textarea {
+  background: var(--panel-2);
+  color: var(--ink);
+  outline: none;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--sub) !important;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted-fg);
+  opacity: 0.7;
+}
+
+a {
+  color: var(--link);
+}
